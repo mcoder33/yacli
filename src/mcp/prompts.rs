@@ -763,7 +763,7 @@ fn render_calendar_prompt(arguments: &Value) -> Result<String> {
 1. При необходимости подтверди аккаунт и авторизацию.\n\
 2. Если непонятно, в каком календаре работать, вызови `yacli.calendar.calendars`.\n\
 3. Используй `yacli.calendar.events` с как можно более узким временным окном.\n\
-4. Если задача write-oriented, используй `yacli.calendar.create` или `yacli.calendar.delete` с явным календарём и точными timestamps или UID.\n\
+4. Для записи используй `yacli.calendar.create`, `yacli.calendar.update` или `yacli.calendar.delete` с явным календарём и точными timestamps или UID. Для update укажи account, scope=event либо scope=occurrence и исходный RECURRENCE-ID; сначала проверь dry_run.\n\
 5. Верни короткую сводку по расписанию или результат write-действия: время, название, место и конфликты, если они видны.\n\
 \n\
 Изменение существующего события beyond create/delete через MCP пока не поддержано. Если пользователь просит редактирование на месте, явно объясни этот gap."

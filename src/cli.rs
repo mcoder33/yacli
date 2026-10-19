@@ -826,6 +826,36 @@ pub enum CalendarCommand {
         )]
         dry_run: bool,
     },
+    /// Изменить событие или перенести один экземпляр серии (псевдоним: move).
+    #[command(alias = "move")]
+    Update {
+        #[arg(long, value_name = "АККАУНТ")]
+        account: String,
+        #[arg(long, value_name = "КАЛЕНДАРЬ")]
+        calendar: String,
+        #[arg(value_name = "UID")]
+        uid: String,
+        #[arg(long, value_parser = ["event", "occurrence"], value_name = "ОБЛАСТЬ")]
+        scope: String,
+        /// Исходный RECURRENCE-ID: RFC3339 или YYYY-MM-DD.
+        #[arg(long)]
+        occurrence: Option<String>,
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        location: Option<String>,
+        /// ETag из предыдущего предпросмотра.
+        #[arg(long)]
+        if_match: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Удалить событие по ID.
     Delete {
         #[arg(long, value_name = "АККАУНТ")]

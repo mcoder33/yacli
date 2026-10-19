@@ -509,16 +509,16 @@ fn workflow_execution_actions(
         }
     }
 
-    if next_action == "resume" && latest_activity.is_some() {
-        if let Some(entry) = latest_activity.filter(|entry| activity_entry_supports_undo(entry)) {
-            actions.push(json!({
-                "kind": "undo_activity",
-                "label": "Cleanup workflow result",
-                "workflow_id": id,
-                "activity_id": entry.id,
-                "operation": entry.operation,
-            }));
-        }
+    if next_action == "resume"
+        && let Some(entry) = latest_activity.filter(|entry| activity_entry_supports_undo(entry))
+    {
+        actions.push(json!({
+            "kind": "undo_activity",
+            "label": "Cleanup workflow result",
+            "workflow_id": id,
+            "activity_id": entry.id,
+            "operation": entry.operation,
+        }));
     }
 
     actions

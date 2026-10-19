@@ -2110,21 +2110,23 @@ fn decode_modified_utf7(raw_name: &str) -> Result<String> {
         }
 
         let mut base64 = shifted.replace(',', "/");
-        while base64.len() % 4 != 0 {
+        while !base64.len().is_multiple_of(4) {
             base64.push('=');
         }
 
         let bytes = STANDARD.decode(base64.as_bytes()).map_err(|err| {
             YacliError::Serialization(format!("invalid modified UTF-7 folder name: {err}"))
         })?;
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(YacliError::Serialization(
                 "modified UTF-7 folder name is not valid UTF-16BE".to_string(),
             ));
         }
 
         let utf16 = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         let text = String::from_utf16(&utf16).map_err(|err| {

@@ -13,9 +13,10 @@ use crate::activity_undo::{
 };
 use crate::calendar::{
     CalendarCollection, CalendarCreateRequest, CalendarCreateReview, CalendarEvent,
-    CalendarEventWindow, CalendarEventsRequest, CalendarInvite, calendar_create_command,
-    calendar_create_request_from_invites, create_calendar_event, delete_calendar_event,
-    list_calendar_events, list_calendars, parse_event_window, review_calendar_event_creation,
+    CalendarEventWindow, CalendarEventsRequest, CalendarInvite, CalendarUpdateRequest,
+    calendar_create_command, calendar_create_request_from_invites, create_calendar_event,
+    delete_calendar_event, list_calendar_events, list_calendars, parse_event_window,
+    review_calendar_event_creation, update_calendar_event,
 };
 use crate::cli::{
     AccountCommand, ActivityCommand, AuthCommand, AuthServiceArg, CalendarCommand, Cli, Command,
@@ -2387,6 +2388,67 @@ fn execute_calendar(format: OutputFormat, action: CalendarCommand) -> Result<Ren
                     });
                 })
             }
+        }
+        CalendarCommand::Update {
+            account,
+            calendar,
+            uid,
+            scope,
+            occurrence,
+            start,
+            end,
+            summary,
+            description,
+            location,
+            if_match,
+            dry_run,
+        } => {
+            let (resolved_account, app_password, context) =
+                resolve_calendar_private_context(Some(&account))?;
+            let outcome = update_calendar_event(
+                &context.caldav_base_url,
+                &context.email,
+                &app_password,
+                CalendarUpdateRequest {
+                    calendar,
+                    uid,
+                    scope,
+                    occurrence,
+                    start,
+                    end,
+                    summary,
+                    description,
+                    location,
+                    if_match,
+                },
+                dry_run,
+            )?;
+            let mut payload = serde_json::to_value(&outcome)
+                .map_err(|err| YacliError::Serialization(err.to_string()))?;
+            payload["account"] = json!(resolved_account);
+            let table = format!(
+                "account\t{}\ncalendar\t{}\nscope\t{}\ndry_run\t{}\nbefore\t{} — {}\nafter\t{} — {}\nwrite_outcome\t{}\nscheduling\t{}",
+                resolved_account,
+                outcome.calendar.id,
+                outcome.scope,
+                dry_run,
+                outcome.before.start.as_deref().unwrap_or("-"),
+                outcome.before.end.as_deref().unwrap_or("-"),
+                outcome.after.start.as_deref().unwrap_or("-"),
+                outcome.after.end.as_deref().unwrap_or("-"),
+                outcome.write_outcome,
+                outcome.scheduling
+            );
+            ok_output(
+                format,
+                if dry_run {
+                    "calendar.update.review"
+                } else {
+                    "calendar.update"
+                },
+                payload,
+                table,
+            )
         }
         CalendarCommand::Delete {
             account,
@@ -5835,6 +5897,7 @@ fn calendar_event_json(event: &CalendarEvent) -> serde_json::Value {
         "calendar_name": event.calendar_name,
         "href": event.href,
         "id": event.uid,
+        "recurrence_id": event.recurrence_id,
         "summary": event.summary,
         "start": event.start,
         "end": event.end,
@@ -5877,18 +5940,19 @@ fn render_calendar_events_table(
         format!("window.from\t{}", window.from),
         format!("window.to\t{}", window.to),
         format!("count\t{}", events.len()),
-        "ID\tSTART\tEND\tSUMMARY\tLOCATION\tSTATUS\tALL_DAY".to_string(),
+        "ID\tSTART\tEND\tSUMMARY\tLOCATION\tSTATUS\tALL_DAY\tRECURRENCE_ID".to_string(),
     ];
     lines.extend(events.iter().map(|event| {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             event.uid.as_deref().unwrap_or("-"),
             event.start.as_deref().unwrap_or("-"),
             event.end.as_deref().unwrap_or("-"),
             event.summary.as_deref().unwrap_or("-"),
             event.location.as_deref().unwrap_or("-"),
             event.status.as_deref().unwrap_or("-"),
-            event.all_day
+            event.all_day,
+            event.recurrence_id.as_deref().unwrap_or("-")
         )
     }));
     lines.join("\n")

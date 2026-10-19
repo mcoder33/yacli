@@ -12,6 +12,8 @@ use url::Url;
 
 use crate::error::{Result, YacliError};
 
+mod ical;
+
 const CALDAV_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_EVENT_WINDOW_DAYS: u64 = 30;
 
@@ -38,6 +40,8 @@ pub struct CalendarEvent {
     pub href: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +94,74 @@ pub struct CalendarCreateRequest {
     pub end: String,
     pub description: Option<String>,
     pub location: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CalendarUpdateRequest {
+    pub calendar: String,
+    pub uid: String,
+    /// `event` for a standalone event, `occurrence` for one recurring instance.
+    pub scope: String,
+    pub occurrence: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    /// Optional binding to a previously reviewed version.
+    pub if_match: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CalendarUpdateOutcome {
+    pub calendar: CalendarCollection,
+    pub scope: String,
+    pub dry_run: bool,
+    pub before: CalendarEvent,
+    pub after: CalendarEvent,
+    pub write_outcome: String,
+    pub scheduling: String,
+}
+
+pub fn update_calendar_event(
+    base_url: &str,
+    account: &str,
+    app_password: &str,
+    request: CalendarUpdateRequest,
+    dry_run: bool,
+) -> Result<CalendarUpdateOutcome> {
+    validate_update_request(&request)?;
+    CaldavClient::new(base_url, account, app_password)?.update_event(request, dry_run)
+}
+
+fn validate_update_request(request: &CalendarUpdateRequest) -> Result<()> {
+    if request.uid.trim().is_empty() || request.calendar.trim().is_empty() {
+        return Err(YacliError::Validation(
+            "calendar and UID must be explicit and nonempty".to_string(),
+        ));
+    }
+    match request.scope.as_str() {
+        "event" if request.occurrence.is_none() => {},
+        "occurrence" if request.occurrence.is_some() => {},
+        _ => return Err(YacliError::Validation("use scope=event, or scope=occurrence with an original recurrence id; series updates are unsupported".to_string())),
+    }
+    for input in [&request.start, &request.end, &request.occurrence]
+        .into_iter()
+        .flatten()
+    {
+        ical::EventTime::input(input)?;
+    }
+    if request.start.is_none()
+        && request.end.is_none()
+        && request.summary.is_none()
+        && request.description.is_none()
+        && request.location.is_none()
+    {
+        return Err(YacliError::Validation(
+            "update requires at least one changed field".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -304,6 +376,30 @@ struct ParsedCalendarWriteWindow {
     all_day: bool,
 }
 
+fn normalize_strong_etag(raw: &str) -> Result<String> {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|tag| tag.strip_suffix('"'))
+        && inner
+            .bytes()
+            .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte))
+    {
+        return Ok(raw.to_string());
+    }
+    // Yandex CalDAV sends numeric version tokens without the required quotes.
+    // Use the standard quoted form in If-Match; never weaken the precondition.
+    if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(format!("\"{raw}\""));
+    }
+    Err(YacliError::Integrity(
+        "CalDAV update requires a strong ETag".to_string(),
+    ))
+}
+
+struct CalendarObject {
+    body: String,
+    etag: String,
+    schedule_tag: Option<String>,
+}
+
 struct CaldavClient {
     http: Client,
     base_url: Url,
@@ -318,6 +414,7 @@ impl CaldavClient {
         let http = Client::builder()
             .user_agent(format!("yacli/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(CALDAV_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -368,18 +465,29 @@ impl CaldavClient {
     }
 
     fn find_calendar(&self, calendar_ref: &str) -> Result<CalendarCollection> {
-        self.list_calendars()?
-            .into_iter()
-            .find(|calendar| {
-                calendar.id == calendar_ref
-                    || calendar.name == calendar_ref
-                    || calendar.href == calendar_ref
-            })
-            .ok_or_else(|| {
-                YacliError::Validation(format!(
-                    "calendar `{calendar_ref}` not found; run `yacli calendar calendars` to inspect available ids"
-                ))
-            })
+        let calendars = self.list_calendars()?;
+        let exact = calendars
+            .iter()
+            .filter(|c| c.id == calendar_ref || c.href == calendar_ref)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matching = if exact.is_empty() {
+            calendars
+                .into_iter()
+                .filter(|c| c.name == calendar_ref)
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
+        match matching.len() {
+            1 => Ok(matching.remove(0)),
+            0 => Err(YacliError::Validation(format!(
+                "calendar `{calendar_ref}` not found; run `yacli calendar calendars` to inspect available ids"
+            ))),
+            _ => Err(YacliError::Validation(format!(
+                "calendar `{calendar_ref}` is ambiguous; use its unique id or href"
+            ))),
+        }
     }
 
     fn list_events(
@@ -400,39 +508,337 @@ impl CaldavClient {
 
         let mut events = Vec::new();
         for response in parse_dav_responses(&xml)? {
-            let Some(calendar_data) = response.calendar_data.as_deref() else {
-                continue;
-            };
-            let href = response.href.unwrap_or_else(|| calendar.href.clone());
-            for event in parse_ical_events(calendar_data)? {
-                events.push(CalendarEvent {
-                    calendar_id: calendar.id.clone(),
-                    calendar_name: calendar.name.clone(),
-                    href: href.clone(),
-                    uid: event.uid,
-                    summary: event.summary,
-                    start: event.start,
-                    end: event.end,
-                    description: event.description,
-                    location: event.location,
-                    status: event.status,
-                    etag: response.getetag.clone(),
-                    all_day: event.all_day,
-                });
+            let calendar_data = response.calendar_data.as_deref().ok_or_else(|| {
+                YacliError::Integrity(
+                    "CalDAV REPORT omitted calendar-data; refusing an incomplete list".to_string(),
+                )
+            })?;
+            let href = response.href.ok_or_else(|| {
+                YacliError::Integrity("calendar resource missing href".to_string())
+            })?;
+            events.extend(ical::expanded_events(
+                calendar_data,
+                &calendar,
+                &href,
+                response.getetag.as_deref(),
+                request,
+            )?);
+        }
+        // Compare instants, not RFC3339 strings with potentially different offsets.
+        events.sort_by_key(|event| {
+            (
+                ical::EventTime::input(event.start.as_deref().unwrap_or_default())
+                    .expect("validated event time")
+                    .instant(),
+                event.uid.clone(),
+                event.recurrence_id.clone(),
+            )
+        });
+        let mut seen = std::collections::BTreeMap::new();
+        let mut unique = Vec::new();
+        for event in events {
+            let uid = event
+                .uid
+                .clone()
+                .ok_or_else(|| YacliError::Integrity("VEVENT missing UID".to_string()))?;
+            let key = (uid, event.recurrence_id.clone());
+            if let Some(previous) = seen.get(&key) {
+                if previous != &event {
+                    return Err(YacliError::Integrity(
+                        "conflicting duplicate calendar instance".to_string(),
+                    ));
+                }
+            } else {
+                seen.insert(key, event.clone());
+                unique.push(event);
             }
         }
-
-        events.sort_by(|left, right| {
-            left.start
-                .cmp(&right.start)
-                .then(left.summary.cmp(&right.summary))
-                .then(left.uid.cmp(&right.uid))
-        });
-        if events.len() > request.limit {
-            events.truncate(request.limit);
-        }
+        unique.truncate(request.limit);
+        let events = unique;
 
         Ok((calendar, events))
+    }
+
+    fn update_event(
+        &self,
+        request: CalendarUpdateRequest,
+        dry_run: bool,
+    ) -> Result<CalendarUpdateOutcome> {
+        let calendar = self.find_calendar(&request.calendar)?;
+        let href = self.find_resource_href(&calendar, &request.uid)?;
+        let url = self.event_url(&calendar, &href)?;
+        let original = self.read_calendar_object(&url)?;
+        if request
+            .if_match
+            .as_deref()
+            .map(normalize_strong_etag)
+            .transpose()?
+            .is_some_and(|etag| etag != original.etag)
+        {
+            return Err(YacliError::Integrity(
+                "calendar version changed since review; no write performed".to_string(),
+            ));
+        }
+        let expanded = if let Some(occurrence) = request.occurrence.as_deref() {
+            if !ical::has_detached(&original.body, &request.uid, occurrence)? {
+                Some(self.expand_occurrence(
+                    &calendar,
+                    &href,
+                    &original.etag,
+                    &request.uid,
+                    occurrence,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let plan = ical::plan_update(
+            &original.body,
+            expanded.as_ref(),
+            &request,
+            &calendar,
+            &href,
+            &original.etag,
+            &self.account,
+        )?;
+        if dry_run {
+            return Ok(CalendarUpdateOutcome {
+                calendar,
+                scope: request.scope,
+                dry_run: true,
+                before: plan.before,
+                after: plan.after,
+                write_outcome: "not_written".to_string(),
+                scheduling: "no_notifications_sent".to_string(),
+            });
+        }
+        let put = self
+            .http
+            .put(url.clone())
+            .basic_auth(&self.account, Some(&self.app_password))
+            .header("Content-Type", "text/calendar; charset=utf-8")
+            .header("If-Match", &original.etag);
+        let put = if let Some(tag) = &original.schedule_tag {
+            put.header("If-Schedule-Tag-Match", tag)
+        } else {
+            put
+        };
+        // Exactly one write attempt. A transport error/5xx may mean the write succeeded.
+        let (uncertain, status) = match put.body(plan.body.clone()).send() {
+            Ok(response) => (response.status().is_server_error(), Some(response.status())),
+            Err(_) => (true, None),
+        };
+        if let Some(status) = status {
+            if status == StatusCode::PRECONDITION_FAILED {
+                return Err(YacliError::Integrity(
+                    "CalDAV update conflict (412); event changed concurrently, no retry performed"
+                        .to_string(),
+                ));
+            }
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Err(YacliError::Auth(format!(
+                    "CalDAV update denied ({}); verify organizer and calendar write rights",
+                    status.as_u16()
+                )));
+            }
+            if !status.is_success() && !uncertain {
+                return Err(YacliError::Api(format!(
+                    "CalDAV update rejected with status {}; no retry performed",
+                    status.as_u16()
+                )));
+            }
+        }
+        let verified = self.read_calendar_object(&url)
+            .and_then(|saved| {
+                ical::verify_saved_document(&plan.body, &saved.body)?;
+                ical::verified_event(&saved.body, &plan.after, &calendar, &saved.etag)
+            })
+            .map_err(|_| YacliError::Integrity("calendar update outcome is unverified; read the event before retrying (no automatic retry performed)".to_string()))?;
+        Ok(CalendarUpdateOutcome {
+            calendar,
+            scope: request.scope,
+            dry_run: false,
+            before: plan.before,
+            after: verified,
+            write_outcome: if uncertain {
+                "verified_after_uncertain_response"
+            } else {
+                "verified"
+            }
+            .to_string(),
+            scheduling: "server_managed_delivery_unverified".to_string(),
+        })
+    }
+
+    fn find_resource_href(&self, calendar: &CalendarCollection, uid: &str) -> Result<String> {
+        let xml = self.send_xml(
+            Method::from_bytes(b"REPORT").expect("REPORT"),
+            &self.resolve_href(&calendar.href)?,
+            Some("1"),
+            &build_calendar_uid_query_xml(uid),
+            "CalDAV update lookup",
+        )?;
+        let mut hrefs = std::collections::BTreeSet::new();
+        for response in parse_dav_responses(&xml)? {
+            if let Some(data) = response.calendar_data
+                && ical::resource_has_uid(&data, uid)?
+            {
+                hrefs.insert(response.href.ok_or_else(|| {
+                    YacliError::Integrity("calendar object missing href".to_string())
+                })?);
+            }
+        }
+        if hrefs.len() != 1 {
+            return Err(YacliError::Validation(
+                "expected exactly one calendar resource for UID".to_string(),
+            ));
+        }
+        Ok(hrefs.into_iter().next().expect("one href"))
+    }
+
+    fn event_url(&self, calendar: &CalendarCollection, href: &str) -> Result<Url> {
+        let collection = self.resolve_href(&calendar.href)?;
+        let url = self.resolve_href(href)?;
+        let prefix = format!("{}/", collection.path().trim_end_matches('/'));
+        if url.origin() != self.base_url.origin()
+            || collection.origin() != self.base_url.origin()
+            || !url.path().starts_with(&prefix)
+            || url.path() == prefix
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(YacliError::Integrity(
+                "CalDAV resource is outside the selected calendar/origin".to_string(),
+            ));
+        }
+        Ok(url)
+    }
+
+    fn read_calendar_object(&self, url: &Url) -> Result<CalendarObject> {
+        let response = self
+            .http
+            .get(url.clone())
+            .basic_auth(&self.account, Some(&self.app_password))
+            .send()?;
+        if !response.status().is_success() {
+            return Err(YacliError::Api(format!(
+                "CalDAV GET failed with status {}",
+                response.status().as_u16()
+            )));
+        }
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                YacliError::Integrity("CalDAV update requires a strong ETag".to_string())
+            })
+            .and_then(normalize_strong_etag)?;
+        let schedule_tag = response
+            .headers()
+            .get("Schedule-Tag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = String::from_utf8(response.bytes()?.to_vec()).map_err(|_| {
+            YacliError::Serialization(
+                "CalDAV object is not valid UTF-8; refusing a lossy update".to_string(),
+            )
+        })?;
+        Ok(CalendarObject {
+            body,
+            etag,
+            schedule_tag,
+        })
+    }
+
+    fn expand_occurrence(
+        &self,
+        calendar: &CalendarCollection,
+        href: &str,
+        etag: &str,
+        uid: &str,
+        occurrence: &str,
+    ) -> Result<CalendarEvent> {
+        let time = ical::EventTime::input(occurrence)?;
+        let from = time.instant();
+        let to = from
+            .checked_add_signed(chrono::Duration::days(1))
+            .ok_or_else(|| YacliError::Validation("occurrence overflow".to_string()))?;
+        let request = CalendarEventsRequest {
+            calendar: calendar.id.clone(),
+            from,
+            to,
+            limit: 100,
+        };
+        // A multiget expands exactly the object fetched above, avoiding a second discovery.
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+<d:prop><d:getetag/><c:calendar-data><c:expand start="{}" end="{}"/></c:calendar-data></d:prop>
+<d:href>{}</d:href></c:calendar-multiget>"#,
+            from.format("%Y%m%dT%H%M%SZ"),
+            to.format("%Y%m%dT%H%M%SZ"),
+            escape_xml_text(href)
+        );
+        let response = self.send_xml(
+            Method::from_bytes(b"REPORT").expect("REPORT"),
+            &self.resolve_href(&calendar.href)?,
+            Some("1"),
+            &xml,
+            "CalDAV occurrence expansion",
+        )?;
+        let mut matching = Vec::new();
+        for response in parse_dav_responses(&response)? {
+            if response
+                .href
+                .as_deref()
+                .map(|v| self.resolve_href(v))
+                .transpose()?
+                .as_ref()
+                != Some(&self.resolve_href(href)?)
+            {
+                continue;
+            }
+            if response
+                .getetag
+                .as_deref()
+                .map(normalize_strong_etag)
+                .transpose()?
+                .as_deref()
+                != Some(etag)
+            {
+                return Err(YacliError::Integrity(
+                    "calendar changed during occurrence expansion; no write performed".to_string(),
+                ));
+            }
+            if let Some(data) = response.calendar_data {
+                matching.extend(
+                    ical::expanded_events(&data, calendar, href, Some(etag), &request)?
+                        .into_iter()
+                        .filter_map(|mut event| {
+                            let identity = time.display();
+                            // RFC 4791 permits the initial expanded instance to omit RECURRENCE-ID.
+                            let matches = event.recurrence_id.as_deref() == Some(identity.as_str())
+                                || (event.recurrence_id.is_none()
+                                    && event.start.as_deref() == Some(identity.as_str()));
+                            if event.uid.as_deref() == Some(uid) && matches {
+                                event.recurrence_id = Some(identity);
+                                Some(event)
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            }
+        }
+        if matching.len() != 1 {
+            return Err(YacliError::Validation("occurrence not uniquely present in server expansion; it may be excluded or cancelled".to_string()));
+        }
+        Ok(matching.remove(0))
     }
 
     fn create_event(
@@ -540,6 +946,7 @@ impl CaldavClient {
                     calendar_name: calendar.name.clone(),
                     href: href.clone(),
                     uid: event.uid,
+                    recurrence_id: event.recurrence_id,
                     summary: event.summary,
                     start: event.start,
                     end: event.end,
@@ -726,9 +1133,19 @@ impl CaldavClient {
     }
 
     fn resolve_href(&self, href: &str) -> Result<Url> {
-        self.base_url
+        let url = self
+            .base_url
             .join(href)
-            .map_err(|err| YacliError::Config(format!("invalid CalDAV href `{href}`: {err}")))
+            .map_err(|err| YacliError::Config(format!("invalid CalDAV href: {err}")))?;
+        if url.origin() != self.base_url.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(YacliError::Integrity(
+                "CalDAV href points outside the configured origin".to_string(),
+            ));
+        }
+        Ok(url)
     }
 }
 
@@ -884,17 +1301,7 @@ fn build_calendar_query_xml(request: &CalendarEventsRequest) -> String {
   <d:prop>
     <d:getetag/>
     <c:calendar-data>
-      <c:comp name="VCALENDAR">
-        <c:comp name="VEVENT">
-          <c:prop name="UID"/>
-          <c:prop name="SUMMARY"/>
-          <c:prop name="DTSTART"/>
-          <c:prop name="DTEND"/>
-          <c:prop name="DESCRIPTION"/>
-          <c:prop name="LOCATION"/>
-          <c:prop name="STATUS"/>
-        </c:comp>
-      </c:comp>
+      <c:expand start="{from}" end="{to}"/>
     </c:calendar-data>
   </d:prop>
   <c:filter>
@@ -916,19 +1323,7 @@ fn build_calendar_uid_query_xml(uid: &str) -> String {
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop>
     <d:getetag/>
-    <c:calendar-data>
-      <c:comp name="VCALENDAR">
-        <c:comp name="VEVENT">
-          <c:prop name="UID"/>
-          <c:prop name="SUMMARY"/>
-          <c:prop name="DTSTART"/>
-          <c:prop name="DTEND"/>
-          <c:prop name="DESCRIPTION"/>
-          <c:prop name="LOCATION"/>
-          <c:prop name="STATUS"/>
-        </c:comp>
-      </c:comp>
-    </c:calendar-data>
+    <c:calendar-data/>
   </d:prop>
   <c:filter>
     <c:comp-filter name="VCALENDAR">
@@ -1099,6 +1494,7 @@ fn sanitize_uid_for_href(uid: &str) -> String {
 #[derive(Default)]
 struct RawCalendarEvent {
     uid: Option<String>,
+    recurrence_id: Option<String>,
     summary: Option<String>,
     start: Option<String>,
     end: Option<String>,
@@ -1136,6 +1532,18 @@ fn parse_ical_events(calendar_data: &str) -> Result<Vec<RawCalendarEvent>> {
                     "DESCRIPTION" => event.description = Some(unescape_ical_text(&value)),
                     "LOCATION" => event.location = Some(unescape_ical_text(&value)),
                     "STATUS" => event.status = Some(value),
+                    "RECURRENCE-ID" => {
+                        let (normalized, _) = normalize_ical_datetime(
+                            &value,
+                            params
+                                .iter()
+                                .find_map(|(k, v)| (k == "TZID").then_some(v.as_str())),
+                            params
+                                .iter()
+                                .find_map(|(k, v)| (k == "VALUE").then_some(v.as_str())),
+                        );
+                        event.recurrence_id = Some(normalized);
+                    }
                     "DTSTART" => {
                         let (normalized, all_day) = normalize_ical_datetime(
                             &value,
@@ -1239,12 +1647,24 @@ fn normalize_ical_datetime(
 }
 
 fn unescape_ical_text(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut text = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            text.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => text.push('\n'),
+            Some(ch @ ('\\' | ',' | ';')) => text.push(ch),
+            Some(ch) => {
+                text.push('\\');
+                text.push(ch);
+            }
+            None => text.push('\\'),
+        }
+    }
+    text
 }
 
 fn escape_ical_text(value: &str) -> String {
@@ -1540,5 +1960,24 @@ END:VCALENDAR]]></c:calendar-data>
         let query = build_calendar_uid_query_xml("evt<&>\"'");
         assert!(query.contains("evt&lt;&amp;&gt;&quot;&apos;"));
         assert!(query.contains("prop-filter name=\"UID\""));
+    }
+    #[test]
+    fn ical_text_escaping_preserves_literal_backslash_sequences_in_uids() {
+        for text in [
+            r"uid\n-literal",
+            r"uid\N-literal",
+            r"uid\\,comma",
+            "line\nnext",
+            "юникод,;\\",
+        ] {
+            assert_eq!(
+                super::unescape_ical_text(&super::escape_ical_text(text)),
+                text
+            );
+        }
+        assert_ne!(
+            super::unescape_ical_text(r"uid\\n"),
+            super::unescape_ical_text(r"uid\n")
+        );
     }
 }

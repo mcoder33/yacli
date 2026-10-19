@@ -7223,3 +7223,163 @@ rest_base_url = "{}"
 
     assert_eq!(fs::read(&output_path).expect("existing file"), b"existing");
 }
+
+#[test]
+fn calendar_events_filters_historical_exceptions_before_limit() {
+    let temp = tempdir().expect("tempdir");
+    let mut caldav = Server::new();
+
+    write_mock_account_with_calendar_refs(temp.path(), &caldav.url(), Some("store:calendar"));
+    write_credentials_file(
+        temp.path(),
+        r#"
+version = 1
+
+[accounts.mock.services.calendar]
+kind = "app_password"
+secret = "calendar-secret"
+"#,
+    );
+
+    let auth = basic_auth_header("me@yandex.ru", "calendar-secret");
+
+    let _principal = caldav
+        .mock("PROPFIND", "/")
+        .match_header("authorization", auth.as_str())
+        .match_header("depth", "0")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/users/me@yandex.ru/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        )
+        .create();
+
+    let _home = caldav
+        .mock("PROPFIND", "/principals/users/me@yandex.ru/")
+        .match_header("authorization", auth.as_str())
+        .match_header("depth", "0")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/users/me@yandex.ru/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/me@yandex.ru/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        )
+        .create();
+
+    let _collections = caldav
+        .mock("PROPFIND", "/calendars/me@yandex.ru/")
+        .match_header("authorization", auth.as_str())
+        .match_header("depth", "1")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/me@yandex.ru/default/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Личный</d:displayname>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        )
+        .create();
+
+    let _report = caldav
+        .mock("REPORT", "/calendars/me@yandex.ru/default/")
+        .match_header("authorization", auth.as_str())
+        .match_header("depth", "1")
+        .match_body(Matcher::Regex(
+            "time-range start=\"20260312T000000Z\" end=\"20260319T000000Z\"".to_string(),
+        ))
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/me@yandex.ru/default/event-1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"evt-1"</d:getetag>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:event-1
+RECURRENCE-ID:20260212T090000Z
+SUMMARY:Historical exception
+DTSTART:20260213T090000Z
+DTEND:20260213T100000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:event-1
+RECURRENCE-ID:20260312T090000Z
+SUMMARY:Синк команды
+DTSTART:20260312T090000Z
+DTEND:20260312T100000Z
+LOCATION:Meet
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        )
+        .create();
+
+    let output = yacli()
+        .env("YACLI_CONFIG_DIR", temp.path())
+        .args([
+            "calendar",
+            "events",
+            "--account",
+            "mock",
+            "2026-03-12",
+            "2026-03-19",
+            "--limit",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["operation"], "calendar.events");
+    assert_eq!(value["calendar"]["id"], "default");
+    assert_eq!(value["window"]["from"], "2026-03-12T00:00:00Z");
+    assert_eq!(value["window"]["to"], "2026-03-19T00:00:00Z");
+    assert_eq!(value["events"].as_array().expect("events").len(), 1);
+    assert_eq!(value["events"][0]["id"], "event-1");
+    assert_eq!(value["events"][0]["summary"], "Синк команды");
+    assert_eq!(value["events"][0]["start"], "2026-03-12T09:00:00Z");
+    assert_eq!(value["events"][0]["location"], "Meet");
+}

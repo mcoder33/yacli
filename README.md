@@ -272,6 +272,7 @@ yacli calendar delete <id>
 - Без дат `events` показывает ближайшие 30 дней.
 - `--calendar <id>` для работы не с default-календарём.
 - `calendar create --dry-run` показывает review события без реального CalDAV PUT.
+- В этом форке `calendar update` / `calendar move` и MCP `yacli.calendar.update` изменяют одиночную встречу или один экземпляр серии. Нужны явные `--account`, `--calendar`, `--scope`. [Примеры, сборка, ограничения и откат](docs/calendar-updates.md).
 
 ### Диск
 

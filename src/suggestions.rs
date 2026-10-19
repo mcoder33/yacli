@@ -1687,6 +1687,7 @@ mod tests {
     #[test]
     fn cancelled_calendar_event_detection_is_case_insensitive() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/event.ics".to_string(),
@@ -1706,6 +1707,7 @@ mod tests {
     #[test]
     fn build_live_calendar_cancelled_suggestion_returns_delete_handoff() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/event.ics".to_string(),
@@ -1738,6 +1740,7 @@ mod tests {
     #[test]
     fn suggested_calendar_materials_path_uses_date_and_sanitized_summary() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/event.ics".to_string(),
@@ -1760,6 +1763,7 @@ mod tests {
     #[test]
     fn build_live_calendar_materials_suggestion_returns_mkdir_handoff() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/event.ics".to_string(),
@@ -1797,6 +1801,7 @@ mod tests {
     fn first_recent_follow_up_event_prefers_recent_finished_event() {
         let events = vec![
             CalendarEvent {
+                recurrence_id: None,
                 calendar_id: "team".to_string(),
                 calendar_name: "Команда".to_string(),
                 href: "/cal/team/old.ics".to_string(),
@@ -1811,6 +1816,7 @@ mod tests {
                 all_day: false,
             },
             CalendarEvent {
+                recurrence_id: None,
                 calendar_id: "team".to_string(),
                 calendar_name: "Команда".to_string(),
                 href: "/cal/team/recent.ics".to_string(),
@@ -1837,6 +1843,7 @@ mod tests {
     #[test]
     fn build_live_calendar_publish_materials_suggestion_returns_publish_handoff() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/recent.ics".to_string(),
@@ -1884,6 +1891,7 @@ mod tests {
     #[test]
     fn first_recent_follow_up_message_matches_re_subject() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/review.ics".to_string(),
@@ -1924,6 +1932,7 @@ mod tests {
     #[test]
     fn build_live_calendar_mail_follow_up_suggestion_returns_reply_handoff() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/review.ics".to_string(),
@@ -1965,6 +1974,7 @@ mod tests {
     #[test]
     fn build_live_calendar_mail_link_follow_up_suggestion_returns_reply_with_link_handoff() {
         let event = CalendarEvent {
+            recurrence_id: None,
             calendar_id: "team".to_string(),
             calendar_name: "Команда".to_string(),
             href: "/cal/team/review.ics".to_string(),

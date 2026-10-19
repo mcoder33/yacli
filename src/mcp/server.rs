@@ -50,9 +50,10 @@ use crate::update::check_for_update;
 use crate::workflows;
 use crate::{
     calendar::{
-        CalendarCreateRequest, CalendarEventsRequest, calendar_create_command,
-        calendar_create_request_from_invites, create_calendar_event, delete_calendar_event,
-        list_calendar_events, list_calendars, parse_event_window, review_calendar_event_creation,
+        CalendarCreateRequest, CalendarEventsRequest, CalendarUpdateRequest,
+        calendar_create_command, calendar_create_request_from_invites, create_calendar_event,
+        delete_calendar_event, list_calendar_events, list_calendars, parse_event_window,
+        review_calendar_event_creation, update_calendar_event,
     },
     disk::{
         DownloadedFile, PrivateDiskDownloadRequest, PrivateDiskListRequest,
@@ -1517,6 +1518,26 @@ fn tool_definitions(ui_enabled: bool, roots_enabled: bool) -> Vec<Value> {
             ui_enabled,
         ),
         tool(
+            "yacli.calendar.update",
+            "Update a standalone event or one recurring occurrence; moves preserve duration unless end is supplied. Explicit account/calendar/scope required. dry_run performs no writes. Series updates unsupported.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string", "minLength": 1 },
+                    "calendar": { "type": "string", "minLength": 1 },
+                    "uid": { "type": "string", "minLength": 1 },
+                    "scope": { "type": "string", "enum": ["event", "occurrence"] },
+                    "occurrence": { "type": "string", "description": "Original RECURRENCE-ID as RFC3339 or YYYY-MM-DD, required for occurrence scope" },
+                    "start": { "type": "string" }, "end": { "type": "string" },
+                    "summary": { "type": "string" }, "description": { "type": "string" }, "location": { "type": "string" },
+                    "if_match": { "type": "string", "description": "Optional strong ETag from a previous preview" },
+                    "dry_run": { "type": "boolean" }
+                },
+                "required": ["account", "calendar", "uid", "scope"],
+                "additionalProperties": false
+            }), None, ui_enabled,
+        ),
+        tool(
             "yacli.calendar.delete",
             "Delete one calendar event by UID.",
             json!({
@@ -1878,6 +1899,25 @@ fn call_tool(params: Value, ui_enabled: bool) -> Result<Value> {
                 dry_run: optional_bool(&arguments, "dry_run").unwrap_or(false),
             },
         )?,
+        "yacli.calendar.update" => {
+            validate_calendar_update_arguments(&arguments)?;
+            calendar_update(
+                required_string(&arguments, "account")?,
+                CalendarUpdateRequest {
+                    calendar: required_string(&arguments, "calendar")?.to_string(),
+                    uid: required_string(&arguments, "uid")?.to_string(),
+                    scope: required_string(&arguments, "scope")?.to_string(),
+                    occurrence: optional_string_owned(&arguments, "occurrence"),
+                    start: optional_string_owned(&arguments, "start"),
+                    end: optional_string_owned(&arguments, "end"),
+                    summary: optional_string_owned(&arguments, "summary"),
+                    description: optional_string_owned(&arguments, "description"),
+                    location: optional_string_owned(&arguments, "location"),
+                    if_match: optional_string_owned(&arguments, "if_match"),
+                },
+                optional_bool(&arguments, "dry_run").unwrap_or(false),
+            )?
+        }
         "yacli.calendar.delete" => calendar_delete(
             arguments.get("account").and_then(Value::as_str),
             optional_string(&arguments, "calendar").unwrap_or("default"),
@@ -3034,6 +3074,49 @@ fn calendar_create(account: Option<&str>, request: CalendarCreateToolRequest) ->
             "event": event,
         }))
     }
+}
+
+fn validate_calendar_update_arguments(arguments: &Value) -> Result<()> {
+    let object = arguments.as_object().ok_or_else(|| {
+        YacliError::Validation("calendar.update arguments must be an object".to_string())
+    })?;
+    for (key, value) in object {
+        let valid = match key.as_str() {
+            "dry_run" => value.is_boolean(),
+            "account" | "calendar" | "uid" | "scope" | "occurrence" | "start" | "end"
+            | "summary" | "description" | "location" | "if_match" => value.is_string(),
+            _ => false,
+        };
+        if !valid {
+            return Err(YacliError::Validation(format!(
+                "invalid calendar.update argument `{key}`"
+            )));
+        }
+    }
+    for key in ["account", "calendar", "uid", "scope"] {
+        if required_string(arguments, key)?.trim().is_empty() {
+            return Err(YacliError::Validation(format!(
+                "calendar.update requires nonempty `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn calendar_update(account: &str, request: CalendarUpdateRequest, dry_run: bool) -> Result<Value> {
+    let (resolved_account, app_password, context) =
+        resolve_calendar_private_context(Some(account))?;
+    let outcome = update_calendar_event(
+        &context.caldav_base_url,
+        &context.email,
+        &app_password,
+        request,
+        dry_run,
+    )?;
+    let mut payload =
+        serde_json::to_value(outcome).map_err(|err| YacliError::Serialization(err.to_string()))?;
+    payload["account"] = json!(resolved_account);
+    Ok(payload)
 }
 
 fn calendar_delete(account: Option<&str>, calendar: &str, uid: &str) -> Result<Value> {

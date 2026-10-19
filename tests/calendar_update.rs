@@ -632,3 +632,41 @@ fn changed_etag_during_expansion_prevents_a_write() {
     report.assert();
     put.assert();
 }
+
+#[test]
+fn unquoted_numeric_etag_is_quoted_for_conditional_put() {
+    let mut h = Harness::new(SINGLE);
+    let state = Arc::new(Mutex::new(SINGLE.to_string()));
+    let read_state = state.clone();
+    let get = h
+        .server
+        .mock("GET", HREF)
+        .with_status(200)
+        .with_header("ETag", "1700000000000")
+        .with_body_from_request(move |_| read_state.lock().unwrap().as_bytes().to_vec())
+        .expect(2)
+        .create();
+    let put = h
+        .server
+        .mock("PUT", HREF)
+        .match_header("If-Match", "\"1700000000000\"")
+        .with_status(204)
+        .with_body_from_request(move |req| {
+            *state.lock().unwrap() = req.utf8_lossy_body().unwrap().into_owned();
+            Vec::new()
+        })
+        .expect(1)
+        .create();
+    let output = h
+        .cli(&["--if-match", "1700000000000"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["write_outcome"], "verified");
+    assert_eq!(result["before"]["etag"], "\"1700000000000\"");
+    get.assert();
+    put.assert();
+}

@@ -376,6 +376,24 @@ struct ParsedCalendarWriteWindow {
     all_day: bool,
 }
 
+fn normalize_strong_etag(raw: &str) -> Result<String> {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|tag| tag.strip_suffix('"'))
+        && inner
+            .bytes()
+            .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte))
+    {
+        return Ok(raw.to_string());
+    }
+    // Yandex CalDAV sends numeric version tokens without the required quotes.
+    // Use the standard quoted form in If-Match; never weaken the precondition.
+    if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(format!("\"{raw}\""));
+    }
+    Err(YacliError::Integrity(
+        "CalDAV update requires a strong ETag".to_string(),
+    ))
+}
+
 struct CalendarObject {
     body: String,
     etag: String,
@@ -553,6 +571,8 @@ impl CaldavClient {
         if request
             .if_match
             .as_deref()
+            .map(normalize_strong_etag)
+            .transpose()?
             .is_some_and(|etag| etag != original.etag)
         {
             return Err(YacliError::Integrity(
@@ -714,11 +734,10 @@ impl CaldavClient {
             .headers()
             .get("ETag")
             .and_then(|v| v.to_str().ok())
-            .filter(|v| v.starts_with('"') && v.ends_with('"'))
             .ok_or_else(|| {
                 YacliError::Integrity("CalDAV update requires a strong ETag".to_string())
-            })?
-            .to_string();
+            })
+            .and_then(normalize_strong_etag)?;
         let schedule_tag = response
             .headers()
             .get("Schedule-Tag")
@@ -784,7 +803,14 @@ impl CaldavClient {
             {
                 continue;
             }
-            if response.getetag.as_deref() != Some(etag) {
+            if response
+                .getetag
+                .as_deref()
+                .map(normalize_strong_etag)
+                .transpose()?
+                .as_deref()
+                != Some(etag)
+            {
                 return Err(YacliError::Integrity(
                     "calendar changed during occurrence expansion; no write performed".to_string(),
                 ));

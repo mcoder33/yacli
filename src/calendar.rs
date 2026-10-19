@@ -1621,12 +1621,24 @@ fn normalize_ical_datetime(
 }
 
 fn unescape_ical_text(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut text = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            text.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => text.push('\n'),
+            Some(ch @ ('\\' | ',' | ';')) => text.push(ch),
+            Some(ch) => {
+                text.push('\\');
+                text.push(ch);
+            }
+            None => text.push('\\'),
+        }
+    }
+    text
 }
 
 fn escape_ical_text(value: &str) -> String {
@@ -1922,5 +1934,24 @@ END:VCALENDAR]]></c:calendar-data>
         let query = build_calendar_uid_query_xml("evt<&>\"'");
         assert!(query.contains("evt&lt;&amp;&gt;&quot;&apos;"));
         assert!(query.contains("prop-filter name=\"UID\""));
+    }
+    #[test]
+    fn ical_text_escaping_preserves_literal_backslash_sequences_in_uids() {
+        for text in [
+            r"uid\n-literal",
+            r"uid\N-literal",
+            r"uid\\,comma",
+            "line\nnext",
+            "юникод,;\\",
+        ] {
+            assert_eq!(
+                super::unescape_ical_text(&super::escape_ical_text(text)),
+                text
+            );
+        }
+        assert_ne!(
+            super::unescape_ical_text(r"uid\\n"),
+            super::unescape_ical_text(r"uid\n")
+        );
     }
 }
